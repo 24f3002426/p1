@@ -2,6 +2,8 @@ import os
 import json
 import traceback
 import sys
+import asyncio
+import concurrent.futures
 from io import StringIO
 from contextlib import redirect_stdout
 from fastapi import FastAPI, Request
@@ -31,6 +33,14 @@ app = FastAPI()
 # Store multi-turn history. Format: { chat_id: [messages] }
 chat_histories = {}
 
+# Runs each execute_python call in its own thread, off the asyncio event
+# loop, so a hung/slow call (e.g. a requests.get() with no response) can't
+# freeze the whole bot for every other user. Threads that time out are
+# abandoned (Python can't forcibly kill a thread) but the event loop stays
+# free to keep serving new webhook requests.
+CODE_EXEC_TIMEOUT_SECONDS = 45
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
 # ---------------------------------------------------------
 # Tool: Python Code Execution (Data Analyst Sandboxing)
 # ---------------------------------------------------------
@@ -50,13 +60,40 @@ def execute_python_code(code: str) -> str:
         formatted_error = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         return f"Error executing code:\n{formatted_error}"
 
+
+async def execute_python_code_with_timeout(code: str) -> str:
+    """Runs execute_python_code in a worker thread and enforces a hard wall-clock
+    timeout, so a stuck network call inside the model's code can't hang the
+    server. On timeout, returns an error string to the model (as a tool
+    result) instead of blocking forever."""
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, execute_python_code, code),
+            timeout=CODE_EXEC_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return (
+            f"Error executing code: timed out after {CODE_EXEC_TIMEOUT_SECONDS}s. "
+            "This usually means a network call (e.g. requests.get) hung with no "
+            "timeout set, or the dataset/site is too slow to fetch this way. "
+            "Try adding an explicit timeout= to any requests calls, use a "
+            "different source/approach, or narrow the request (smaller date "
+            "range, different endpoint, etc.)."
+        )
+
 # Tool definition schema for the LLM
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "execute_python",
-            "description": "Execute Python code to process data, download datasets (using requests/pandas), and calculate answers. Prints to stdout will be returned to you.",
+            "description": (
+                f"Execute Python code to process data, download datasets (using requests/pandas), "
+                f"and calculate answers. Prints to stdout will be returned to you. Execution is "
+                f"capped at {CODE_EXEC_TIMEOUT_SECONDS} seconds - always pass timeout=10 (or similar) "
+                f"to any requests.get/post calls, since a hang otherwise wastes your whole budget."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,6 +124,9 @@ async def solve_data_task(chat_id: int, latest_message: str) -> dict:
                     "You are a Data Analyst Agent. You will receive data analysis questions. "
                     "Use the execute_python tool to download data (e.g. MOSPI datasets using pandas or requests) "
                     "and compute the correct answer. "
+                    "ALWAYS pass an explicit timeout (e.g. timeout=10) to any requests.get/post call - "
+                    "a hang with no timeout wastes your whole execution budget. If a source is slow, "
+                    "blocked, or unreachable, try a different URL/approach rather than retrying blindly. "
                     "CRITICAL: When you have the final answer, your final message MUST be a single JSON object. "
                     "Do NOT include markdown formatting (like ```json), do not include explanations, do not include any text outside the JSON object. "
                     "The shape of the JSON object will be specified in the user's prompt. Provide ONLY the specified answer JSON."
@@ -122,7 +162,7 @@ async def solve_data_task(chat_id: int, latest_message: str) -> dict:
                     args = json.loads(tool_call.function.arguments)
                     code_to_run = args.get("code", "")
                     
-                    execution_result = execute_python_code(code_to_run)
+                    execution_result = await execute_python_code_with_timeout(code_to_run)
                     
                     chat_histories[chat_id].append({
                         "role": "tool",
@@ -201,7 +241,19 @@ async def telegram_webhook(request: Request):
                 
         except Exception as e:
             print(f"Error handling webhook: {e}")
-            
+            traceback.print_exc()
+            # Best-effort: let the chat know something broke, instead of
+            # leaving the sender with total silence and no way to tell a
+            # crash apart from "still thinking."
+            try:
+                async with httpx.AsyncClient() as http_client:
+                    await http_client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": chat_id, "text": f"Internal error: {e}"},
+                    )
+            except Exception:
+                pass
+
     return {"status": "ok"}
 
 @app.get("/run.jsonl")
