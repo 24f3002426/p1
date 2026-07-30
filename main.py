@@ -114,7 +114,9 @@ TOOLS = [
 async def solve_data_task(chat_id: int, latest_message: str) -> dict:
     """
     Manages the multi-turn agent loop. Handles tool calls until the agent 
-    produces the final JSON response.
+    produces the final JSON response. Returns (answer_payload, trace) where
+    trace is a list of {code, result} dicts for every tool call made, so the
+    full reasoning path can be logged and inspected later.
     """
     if chat_id not in chat_histories:
         chat_histories[chat_id] = [
@@ -136,8 +138,9 @@ async def solve_data_task(chat_id: int, latest_message: str) -> dict:
     
     chat_histories[chat_id].append({"role": "user", "content": latest_message})
 
-    max_loops = 5
+    max_loops = 8
     loop_count = 0
+    trace = []
 
     while loop_count < max_loops:
         loop_count += 1
@@ -164,6 +167,12 @@ async def solve_data_task(chat_id: int, latest_message: str) -> dict:
                     
                     execution_result = await execute_python_code_with_timeout(code_to_run)
                     
+                    trace.append({
+                        "loop": loop_count,
+                        "code": code_to_run,
+                        "result": str(execution_result),
+                    })
+                    
                     chat_histories[chat_id].append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -188,21 +197,25 @@ async def solve_data_task(chat_id: int, latest_message: str) -> dict:
             
             try:
                 parsed_json = json.loads(final_text)
-                return parsed_json
+                return parsed_json, trace
             except json.JSONDecodeError:
-                return {"error": "Agent did not output valid JSON", "raw_output": final_text}
+                return {"error": "Agent did not output valid JSON", "raw_output": final_text}, trace
 
-    return {"error": "Agent exceeded maximum tool call loops."}
+    return {"error": "Agent exceeded maximum tool call loops."}, trace
 
 # ---------------------------------------------------------
 # Logging and Webhooks
 # ---------------------------------------------------------
-def log_run(chat_id: int, user_query: str, raw_llm_output: dict):
-    """Appends a run entry as a single JSON object to run.jsonl."""
+def log_run(chat_id: int, user_query: str, raw_llm_output: dict, trace: list):
+    """Appends a run entry as a single JSON object to run.jsonl. Includes the
+    full step-by-step trace (each tool call's code + result) so the log is
+    actually useful for reviewing what the agent tried, not just what it
+    ended with."""
     log_entry = {
         "chat_id": chat_id,
         "user_query": user_query,
         "output": raw_llm_output,
+        "trace": trace,
     }
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
@@ -217,10 +230,10 @@ async def telegram_webhook(request: Request):
 
         try:
             # 1. Ask the agent to solve the task
-            answer_payload = await solve_data_task(chat_id, user_text)
+            answer_payload, trace = await solve_data_task(chat_id, user_text)
             
-            # 2. Log to run.jsonl
-            log_run(chat_id, user_text, answer_payload)
+            # 2. Log to run.jsonl (includes full tool-call trace for debugging)
+            log_run(chat_id, user_text, answer_payload, trace)
             
             # 3. Construct the exact JSON structure required by the grader
             log_url = f"{HOST_URL.rstrip('/')}/run.jsonl"
